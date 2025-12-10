@@ -2,6 +2,9 @@ import os
 import json
 import time
 from datetime import datetime, timedelta
+from io import StringIO
+
+import requests
 import pandas as pd
 import yfinance as yf
 
@@ -33,11 +36,13 @@ ALL_KEYS = {**VALUATION_KEYS, **HEALTH_KEYS, **GROWTH_KEYS}
 CACHE_JSON = "data/processed/master.json"
 CACHE_CSV = "data/processed/master.csv"
 
+
 def _is_cache_fresh(path=CACHE_JSON, hours=24):
     if not os.path.exists(path):
         return False
     file_time = datetime.fromtimestamp(os.path.getmtime(path))
     return (datetime.now() - file_time) < timedelta(hours=hours)
+
 
 def load_cached_data():
     if _is_cache_fresh():
@@ -45,6 +50,7 @@ def load_cached_data():
             data = json.load(f)
         return pd.DataFrame(data)
     return None
+
 
 def fetch_single_ticker(ticker: str) -> dict:
     t = yf.Ticker(ticker)
@@ -58,6 +64,7 @@ def fetch_single_ticker(ticker: str) -> dict:
         json.dump(clean, f, default=str, indent=2)
     return clean
 
+
 def fetch_single_ticker_with_retry(ticker: str, max_retries: int = 5, base_delay: int = 30, pause_after_success: float = 1.0):
     delay = base_delay
     for attempt in range(1, max_retries + 1):
@@ -68,14 +75,12 @@ def fetch_single_ticker_with_retry(ticker: str, max_retries: int = 5, base_delay
         except Exception as e:
             msg = str(e)
             if "Rate limited" in msg or "Too Many Requests" in msg:
-                print(f"[{ticker}] Rate limited on attempt {attempt}/{max_retries}, sleeping {delay} seconds...")
                 time.sleep(delay)
                 delay *= 2
             else:
-                print(f"Error fetching {ticker}: {e}")
                 return None
-    print(f"[{ticker}] Failed after {max_retries} attempts due to rate limiting")
     return None
+
 
 def fetch_universe(universe_list):
     records = []
@@ -84,31 +89,41 @@ def fetch_universe(universe_list):
         if rec is not None:
             records.append(rec)
     if not records:
-        print("No records fetched; master files will not be overwritten.")
         return pd.DataFrame()
     df = pd.DataFrame(records)
     os.makedirs("data/processed", exist_ok=True)
-    df.to_csv(CACHE_CSV, index=False)
+    df.to_csv(CACHE_CSV, index=False, na_rep="")
     with open(CACHE_JSON, "w") as f:
         json.dump(df.to_dict(orient="records"), f, default=str, indent=2)
     return df
+
+
+def get_nifty500_tickers() -> list:
+    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        df = pd.read_csv(StringIO(response.text))
+        tickers = [symbol + ".NS" for symbol in df["Symbol"].tolist()]
+        return tickers[:500]
+    except Exception:
+        return [
+            "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "HINDUNILVR.NS",
+            "ICICIBANK.NS", "KOTAKBANK.NS", "SBIN.NS", "BHARTIARTL.NS", "ASIANPAINT.NS",
+        ]
+
 
 def load_data(universe_list, force_refresh: bool = False):
     if not force_refresh:
         cached = load_cached_data()
         if cached is not None and not cached.empty:
-            print("Loaded cached data (<24h old)")
             return cached
-    print("Fetching fresh universe")
     return fetch_universe(universe_list)
 
+
 if __name__ == "__main__":
-    test_tickers = [
-        "TCS.NS", "INFY.NS", "RELIANCE.NS",
-        "HDFCBANK.NS", "ICICIBANK.NS", "TATAMOTORS.NS",
-    ]
-    print("Starting Data Loader")
-    df = load_data(test_tickers, force_refresh=False)
-    print("\nSuccess! Preview of data:")
+    tickers = get_nifty500_tickers()
+    print(len(tickers), "tickers fetched.")
+    df = load_data(tickers[:50], force_refresh=True)
     print(df.head())
-    print(f"\nSaved to: {CACHE_CSV}")
