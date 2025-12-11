@@ -1,0 +1,67 @@
+import pandas as pd
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+df = pd.read_json('data/processed/master.json')
+
+print(f"Loaded {len(df)} companies")
+print("NaN summary:")
+print(df.isnull().sum())
+
+
+bank_keywords = ['BANK', 'FIN', 'NBFC']
+is_bank = df['ticker'].str.contains('|'.join(bank_keywords), na=False)
+bank_df = df[is_bank]
+non_bank_df = df[~is_bank]
+print(f"Banks found: {len(bank_df)}")
+print(f"Non-banks: {len(non_bank_df)}")
+
+def smart_impute(df_group):
+    imputed = df_group.copy()
+    ratio_cols = ['pe_ratio', 'price_to_book', 'ev_ebitda']
+    for col in ratio_cols:
+        imputed[col] = imputed[col].fillna(imputed[col].median())
+    debt_cols = ['debt_to_equity']
+    for col in debt_cols:
+        if is_bank.any():
+            imputed.loc[is_bank, col] = 200.0  
+        else:
+            imputed[col] = imputed[col].fillna(imputed[col].median())
+    cash_cols = ['free_cashflow', 'current_ratio']
+    for col in cash_cols:
+        imputed[col] = imputed[col].fillna(imputed[col].median())
+    growth_cols = ['revenue_growth']
+    for col in growth_cols:
+        imputed[col] = imputed[col].fillna(df[col].median())
+    
+    return imputed
+df_clean = pd.concat([smart_impute(bank_df), smart_impute(non_bank_df)])
+
+df_clean['imputed_count'] = df_clean.isnull().sum(axis=1)
+df_clean = df_clean[df_clean['imputed_count'] <= 4]  
+df_clean['value_score'] = (
+    (1/df_clean['pe_ratio'].clip(5, 100)) * 0.4 +
+    (1/df_clean['price_to_book'].clip(0.5, 10)) * 0.3 +
+    (1/df_clean['ev_ebitda'].clip(5, 50)) * 0.3
+)
+
+df_clean['health_score'] = (
+    (1/df_clean['debt_to_equity'].clip(0, 300)) * 0.4 +
+    df_clean['current_ratio'].clip(0.5, 5) * 0.3 +
+    (df_clean['free_cashflow']/df_clean['market_cap']).clip(-0.1, 0.1) * 0.3
+)
+
+df_clean['growth_score'] = (
+    df_clean['revenue_growth'].clip(-0.2, 0.5) * 0.4 +
+    df_clean['profit_margins'].clip(0, 0.5) * 0.4 +
+    df_clean['roe'].clip(0, 1) * 0.2
+)
+
+os.makedirs('data/processed/clean', exist_ok=True)
+df_clean.to_csv('data/processed/clean/master_clean.csv', index=False)
+df_clean.to_json('data/processed/clean/master_clean.json', indent=2, orient='records')
+
+print(f"Processed: {len(df_clean)} companies")
+print("\nTop 10 by value_score:")
+print(df_clean.nlargest(10, 'value_score')[['ticker', 'value_score', 'pe_ratio', 'health_score']])
