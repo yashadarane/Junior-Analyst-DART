@@ -125,5 +125,6 @@ def load_data(universe_list, force_refresh: bool = False):
 if __name__ == "__main__":
     tickers = get_nifty500_tickers()
     print(len(tickers), "tickers fetched.")
-    df = load_data(tickers[:50], force_refresh=True)
+    df = load_data(tickers, force_refresh=True)
     print(df.head())
+    print("Total Companies Fetched:", len(df))
