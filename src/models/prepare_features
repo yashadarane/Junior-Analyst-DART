@@ -1,67 +1,136 @@
-import pandas as pd
 import os
+import pandas as pd
+import numpy as np
+from sklearn.impute import KNNImputer
 import warnings
 warnings.filterwarnings('ignore')
 
 df = pd.read_json('data/processed/master.json')
-
 print(f"Loaded {len(df)} companies")
-print("NaN summary:")
-print(df.isnull().sum())
 
-
+df['ticker'] = df['ticker'].astype(str)
 bank_keywords = ['BANK', 'FIN', 'NBFC']
 is_bank = df['ticker'].str.contains('|'.join(bank_keywords), na=False)
-bank_df = df[is_bank]
-non_bank_df = df[~is_bank]
-print(f"Banks found: {len(bank_df)}")
-print(f"Non-banks: {len(non_bank_df)}")
 
-def smart_impute(df_group):
-    imputed = df_group.copy()
-    ratio_cols = ['pe_ratio', 'price_to_book', 'ev_ebitda']
-    for col in ratio_cols:
-        imputed[col] = imputed[col].fillna(imputed[col].median())
-    debt_cols = ['debt_to_equity']
-    for col in debt_cols:
-        if is_bank.any():
-            imputed.loc[is_bank, col] = 200.0  
-        else:
-            imputed[col] = imputed[col].fillna(imputed[col].median())
-    cash_cols = ['free_cashflow', 'current_ratio']
-    for col in cash_cols:
-        imputed[col] = imputed[col].fillna(imputed[col].median())
-    growth_cols = ['revenue_growth']
-    for col in growth_cols:
-        imputed[col] = imputed[col].fillna(df[col].median())
-    
-    return imputed
-df_clean = pd.concat([smart_impute(bank_df), smart_impute(non_bank_df)])
+if 'ev_ebitda_final' in df.columns:
+    df['ev_ebitda'] = df['ev_ebitda'].combine_first(df['ev_ebitda_final'])
+elif 'ev_ebitda' not in df.columns:
+    df['ev_ebitda'] = np.nan
 
-df_clean['imputed_count'] = df_clean.isnull().sum(axis=1)
-df_clean = df_clean[df_clean['imputed_count'] <= 4]  
-df_clean['value_score'] = (
-    (1/df_clean['pe_ratio'].clip(5, 100)) * 0.4 +
-    (1/df_clean['price_to_book'].clip(0.5, 10)) * 0.3 +
-    (1/df_clean['ev_ebitda'].clip(5, 50)) * 0.3
+ratio_cols = ['pe_ratio', 'price_to_book', 'ev_ebitda']
+debt_cols = ['debt_to_equity']
+cash_cols = ['free_cashflow', 'current_ratio']
+growth_cols = ['revenue_growth']
+meta_cols = ['market_cap', 'profit_margins', 'roe']
+
+banks = df[is_bank].copy()
+others = df[~is_bank].copy()
+
+for col in ratio_cols:
+    if col in banks.columns:
+        banks[col] = pd.to_numeric(banks[col], errors='coerce').fillna(banks[col].median())
+    if col in others.columns:
+        others[col] = pd.to_numeric(others[col], errors='coerce').fillna(others[col].median())
+
+for col in debt_cols:
+    if col in banks.columns:
+        banks[col] = pd.to_numeric(banks[col], errors='coerce').fillna(banks[col].median()).fillna(200.0)
+    if col in others.columns:
+        others[col] = pd.to_numeric(others[col], errors='coerce').fillna(others[col].median())
+
+for col in cash_cols + growth_cols + meta_cols:
+    if col in banks.columns:
+        banks[col] = pd.to_numeric(banks[col], errors='coerce').fillna(banks[col].median())
+    if col in others.columns:
+        others[col] = pd.to_numeric(others[col], errors='coerce').fillna(others[col].median())
+
+merged = pd.concat([banks, others], axis=0).reset_index(drop=True)
+
+numeric_cols = ratio_cols + debt_cols + cash_cols + growth_cols + meta_cols + ['market_cap', 'free_cashflow', 'total_debt']
+for c in numeric_cols:
+    if c in merged.columns:
+        merged[c] = pd.to_numeric(merged[c], errors='coerce')
+
+imputer_cols = [c for c in numeric_cols if c in merged.columns and merged[c].notna().sum() > 3]
+if len(imputer_cols) > 0 and len(merged) > 5:
+    imputer = KNNImputer(n_neighbors=min(5, len(merged)//2))
+    imputed_array = imputer.fit_transform(merged[imputer_cols])
+    for i, col in enumerate(imputer_cols):
+        merged[col] = imputed_array[:, i]
+
+merged['imputed_count'] = 0
+if len(imputer_cols) > 0:
+    for col in imputer_cols:
+        merged['imputed_count'] += merged[col].isna()
+
+merged = merged[merged['imputed_count'] <= 4].copy()
+merged.reset_index(drop=True, inplace=True)
+
+merged['net_debt'] = merged.get('total_debt', pd.Series(0, index=merged.index)).fillna(0) - merged.get('free_cashflow', pd.Series(0, index=merged.index)).fillna(0)
+
+has_ebitda = 'ebitda' in merged.columns and merged['ebitda'].notna().any()
+has_ev = 'enterprise_value' in merged.columns and merged['enterprise_value'].notna().any()
+
+if has_ev and has_ebitda:
+    merged['ev_over_ebitda_calc'] = np.where(
+        (merged['enterprise_value'].notna()) & 
+        (merged['ebitda'].notna()) & 
+        (merged['ebitda'] != 0),
+        merged['enterprise_value'] / merged['ebitda'], np.nan
+    )
+else:
+    merged['ev_over_ebitda_calc'] = np.nan
+
+merged['ev_ebitda'] = merged['ev_ebitda'].fillna(merged['ev_over_ebitda_calc'])
+
+if has_ebitda:
+    merged['net_debt_ebitda'] = np.where(
+        (merged['net_debt'].notna()) & 
+        (merged['ebitda'].notna()) & 
+        (merged['ebitda'] != 0),
+        merged['net_debt'] / merged['ebitda'], np.nan
+    )
+else:
+    merged['net_debt_ebitda'] = np.nan
+
+merged['earnings_quality'] = (
+    (merged['profit_margins'].fillna(0).clip(0, 0.5)) * 0.5 +
+    (merged['roe'].fillna(0).clip(0, 1)) * 0.5
 )
 
-df_clean['health_score'] = (
-    (1/df_clean['debt_to_equity'].clip(0, 300)) * 0.4 +
-    df_clean['current_ratio'].clip(0.5, 5) * 0.3 +
-    (df_clean['free_cashflow']/df_clean['market_cap']).clip(-0.1, 0.1) * 0.3
-)
+quality_stocks = merged[merged['earnings_quality'] > 0.05].copy()
 
-df_clean['growth_score'] = (
-    df_clean['revenue_growth'].clip(-0.2, 0.5) * 0.4 +
-    df_clean['profit_margins'].clip(0, 0.5) * 0.4 +
-    df_clean['roe'].clip(0, 1) * 0.2
-)
+eps_pe = quality_stocks['pe_ratio'].clip(5, 50)
+ptb = quality_stocks['price_to_book'].clip(0.5, 5)
+ev_eb = quality_stocks['ev_ebitda'].clip(5, 25)
+
+quality_stocks['value_score'] = (
+    (25 / eps_pe) * 0.4 +
+    (3 / ptb) * 0.3 +
+    (15 / ev_eb) * 0.3
+).clip(0, 1) * quality_stocks['earnings_quality']
+
+quality_stocks['health_score'] = (
+    (1 / quality_stocks['debt_to_equity'].replace([0, np.inf, -np.inf], np.nan)
+     .fillna(quality_stocks['debt_to_equity'].median()).clip(1, 1000)) * 0.4 +
+    quality_stocks['current_ratio'].fillna(1).clip(0.1, 10) * 0.3 +
+    (quality_stocks.get('free_cashflow', pd.Series(0, index=quality_stocks.index)) / 
+     quality_stocks.get('market_cap', pd.Series(1, index=quality_stocks.index))).fillna(0).clip(-0.5, 0.5) * 0.3
+).clip(0, 1)
+
+quality_stocks['growth_score'] = (
+    quality_stocks['revenue_growth'].fillna(0).clip(-1, 2) * 0.4 +
+    quality_stocks['profit_margins'].fillna(0).clip(-1, 1) * 0.4 +
+    quality_stocks['roe'].fillna(0).clip(-1, 5) * 0.2
+).clip(0, 1)
+
+merged.loc[quality_stocks.index, ['value_score', 'health_score', 'growth_score']] = quality_stocks[['value_score', 'health_score', 'growth_score']].values
 
 os.makedirs('data/processed/clean', exist_ok=True)
-df_clean.to_csv('data/processed/clean/master_clean.csv', index=False)
-df_clean.to_json('data/processed/clean/master_clean.json', indent=2, orient='records')
+merged.to_csv('data/processed/clean/master_clean.csv', index=False)
+merged.to_json('data/processed/clean/master_clean.json', indent=2, orient='records')
 
-print(f"Processed: {len(df_clean)} companies")
-print("\nTop 10 by value_score:")
-print(df_clean.nlargest(10, 'value_score')[['ticker', 'value_score', 'pe_ratio', 'health_score']])
+print(f"Processed: {len(merged)} companies")
+print(f"Quality stocks (earnings_quality > 0.05): {len(quality_stocks)}")
+print("\nTop 10 Quality Value Stocks:")
+print(quality_stocks.nlargest(10, 'value_score')[['ticker', 'value_score', 'pe_ratio', 'profit_margins', 'roe', 'earnings_quality']])
