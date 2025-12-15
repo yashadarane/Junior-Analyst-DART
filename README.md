@@ -11,7 +11,7 @@
 
 In a market drowning in noise, DART acts as your tireless 24/7 quantitative analyst. It ingests the entire **NIFTY 500** universe, processes thousands of financial data points, reads the news using NLP, and applies machine learning to identify **asymmetric upside opportunities**.
 
-It automates the grunt work of Investment Banking—comps analysis, valuation modeling, and risk assessment—delivering a shortlist of high-quality, undervalued targets in seconds.
+It automates the grunt work of Investment Banking comps analysis, valuation modeling, and risk assessment delivering a shortlist of high-quality, undervalued targets in seconds.
 
 ---
 
