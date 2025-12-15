@@ -5,10 +5,18 @@ from sklearn.impute import KNNImputer
 import warnings
 warnings.filterwarnings('ignore')
 
-df = pd.read_json('data/processed/master.json')
+INPUT_FILE = 'data/processed/master.json'
+OUTPUT_FILE = 'data/processed/clean/master_clean.csv'
+
+if not os.path.exists(INPUT_FILE):
+    print(f"Error: {INPUT_FILE} not found. Run data_loader.py first.")
+    exit()
+
+df = pd.read_json(INPUT_FILE)
 print(f"Loaded {len(df)} companies")
 
 df['ticker'] = df['ticker'].astype(str)
+
 bank_keywords = ['BANK', 'FIN', 'NBFC']
 is_bank = df['ticker'].str.contains('|'.join(bank_keywords), na=False)
 
@@ -21,16 +29,21 @@ ratio_cols = ['pe_ratio', 'price_to_book', 'ev_ebitda']
 debt_cols = ['debt_to_equity']
 cash_cols = ['free_cashflow', 'current_ratio']
 growth_cols = ['revenue_growth']
-meta_cols = ['market_cap', 'profit_margins', 'roe']
+
+meta_cols_numeric = ['market_cap', 'profit_margins', 'roe']
+# Removed meta_cols_text to avoid processing errors
 
 banks = df[is_bank].copy()
 others = df[~is_bank].copy()
 
-for col in ratio_cols:
-    if col in banks.columns:
-        banks[col] = pd.to_numeric(banks[col], errors='coerce').fillna(banks[col].median())
-    if col in others.columns:
-        others[col] = pd.to_numeric(others[col], errors='coerce').fillna(others[col].median())
+def clean_numeric_cols(sub_df, cols):
+    for col in cols:
+        if col in sub_df.columns:
+            sub_df[col] = pd.to_numeric(sub_df[col], errors='coerce').fillna(sub_df[col].median())
+    return sub_df
+
+banks = clean_numeric_cols(banks, ratio_cols)
+others = clean_numeric_cols(others, ratio_cols)
 
 for col in debt_cols:
     if col in banks.columns:
@@ -38,20 +51,20 @@ for col in debt_cols:
     if col in others.columns:
         others[col] = pd.to_numeric(others[col], errors='coerce').fillna(others[col].median())
 
-for col in cash_cols + growth_cols + meta_cols:
-    if col in banks.columns:
-        banks[col] = pd.to_numeric(banks[col], errors='coerce').fillna(banks[col].median())
-    if col in others.columns:
-        others[col] = pd.to_numeric(others[col], errors='coerce').fillna(others[col].median())
+numeric_groups = cash_cols + growth_cols + meta_cols_numeric
+banks = clean_numeric_cols(banks, numeric_groups)
+others = clean_numeric_cols(others, numeric_groups)
 
 merged = pd.concat([banks, others], axis=0).reset_index(drop=True)
 
-numeric_cols = ratio_cols + debt_cols + cash_cols + growth_cols + meta_cols + ['market_cap', 'free_cashflow', 'total_debt']
-for c in numeric_cols:
+numeric_targets = ratio_cols + debt_cols + cash_cols + growth_cols + meta_cols_numeric + ['total_debt', 'enterprise_value', 'ebitda']
+
+for c in numeric_targets:
     if c in merged.columns:
         merged[c] = pd.to_numeric(merged[c], errors='coerce')
 
-imputer_cols = [c for c in numeric_cols if c in merged.columns and merged[c].notna().sum() > 3]
+imputer_cols = [c for c in numeric_targets if c in merged.columns and merged[c].notna().sum() > 3]
+
 if len(imputer_cols) > 0 and len(merged) > 5:
     imputer = KNNImputer(n_neighbors=min(5, len(merged)//2))
     imputed_array = imputer.fit_transform(merged[imputer_cols])
@@ -66,71 +79,58 @@ if len(imputer_cols) > 0:
 merged = merged[merged['imputed_count'] <= 4].copy()
 merged.reset_index(drop=True, inplace=True)
 
-merged['net_debt'] = merged.get('total_debt', pd.Series(0, index=merged.index)).fillna(0) - merged.get('free_cashflow', pd.Series(0, index=merged.index)).fillna(0)
+merged['net_debt'] = merged.get('total_debt', 0).fillna(0) - merged.get('free_cashflow', 0).fillna(0)
 
-has_ebitda = 'ebitda' in merged.columns and merged['ebitda'].notna().any()
-has_ev = 'enterprise_value' in merged.columns and merged['enterprise_value'].notna().any()
+has_ebitda = 'ebitda' in merged.columns
+has_ev = 'enterprise_value' in merged.columns
 
 if has_ev and has_ebitda:
     merged['ev_over_ebitda_calc'] = np.where(
-        (merged['enterprise_value'].notna()) & 
-        (merged['ebitda'].notna()) & 
-        (merged['ebitda'] != 0),
+        (merged['ebitda'].notna()) & (merged['ebitda'] != 0),
         merged['enterprise_value'] / merged['ebitda'], np.nan
     )
-else:
-    merged['ev_over_ebitda_calc'] = np.nan
+    merged['ev_ebitda'] = merged['ev_ebitda'].fillna(merged['ev_over_ebitda_calc'])
 
-merged['ev_ebitda'] = merged['ev_ebitda'].fillna(merged['ev_over_ebitda_calc'])
-
-if has_ebitda:
-    merged['net_debt_ebitda'] = np.where(
-        (merged['net_debt'].notna()) & 
-        (merged['ebitda'].notna()) & 
-        (merged['ebitda'] != 0),
-        merged['net_debt'] / merged['ebitda'], np.nan
-    )
-else:
-    merged['net_debt_ebitda'] = np.nan
-
+# --- FIX 1: Robust Scoring using Percentile Ranks ---
+# Instead of clip, we rank them. Top 10% get 0.9, Bottom 10% get 0.1.
 merged['earnings_quality'] = (
-    (merged['profit_margins'].fillna(0).clip(0, 0.5)) * 0.5 +
-    (merged['roe'].fillna(0).clip(0, 1)) * 0.5
+    merged['profit_margins'].rank(pct=True) * 0.5 + 
+    merged['roe'].rank(pct=True) * 0.5
 )
 
-quality_stocks = merged[merged['earnings_quality'] > 0.05].copy()
+quality_stocks = merged[merged['earnings_quality'] > 0.1].copy()
 
-eps_pe = quality_stocks['pe_ratio'].clip(5, 50)
-ptb = quality_stocks['price_to_book'].clip(0.5, 5)
-ev_eb = quality_stocks['ev_ebitda'].clip(5, 25)
+if not quality_stocks.empty:
+    # Value Score: Lower P/E is better -> Rank ascending=False
+    quality_stocks['value_score'] = (
+        quality_stocks['pe_ratio'].rank(pct=True, ascending=False) * 0.4 +
+        quality_stocks['price_to_book'].rank(pct=True, ascending=False) * 0.3 +
+        quality_stocks['ev_ebitda'].rank(pct=True, ascending=False) * 0.3
+    )
 
-quality_stocks['value_score'] = (
-    (25 / eps_pe) * 0.4 +
-    (3 / ptb) * 0.3 +
-    (15 / ev_eb) * 0.3
-).clip(0, 1) * quality_stocks['earnings_quality']
+    # Health Score: Lower Debt is better
+    quality_stocks['health_score'] = (
+        quality_stocks['debt_to_equity'].rank(pct=True, ascending=False) * 0.4 +
+        quality_stocks['current_ratio'].rank(pct=True) * 0.3
+    )
 
-quality_stocks['health_score'] = (
-    (1 / quality_stocks['debt_to_equity'].replace([0, np.inf, -np.inf], np.nan)
-     .fillna(quality_stocks['debt_to_equity'].median()).clip(1, 1000)) * 0.4 +
-    quality_stocks['current_ratio'].fillna(1).clip(0.1, 10) * 0.3 +
-    (quality_stocks.get('free_cashflow', pd.Series(0, index=quality_stocks.index)) / 
-     quality_stocks.get('market_cap', pd.Series(1, index=quality_stocks.index))).fillna(0).clip(-0.5, 0.5) * 0.3
-).clip(0, 1)
+    # Growth Score: Higher is better
+    quality_stocks['growth_score'] = (
+        quality_stocks['revenue_growth'].rank(pct=True) * 0.4 +
+        quality_stocks['profit_margins'].rank(pct=True) * 0.4 +
+        quality_stocks['roe'].rank(pct=True) * 0.2
+    )
 
-quality_stocks['growth_score'] = (
-    quality_stocks['revenue_growth'].fillna(0).clip(-1, 2) * 0.4 +
-    quality_stocks['profit_margins'].fillna(0).clip(-1, 1) * 0.4 +
-    quality_stocks['roe'].fillna(0).clip(-1, 5) * 0.2
-).clip(0, 1)
-
-merged.loc[quality_stocks.index, ['value_score', 'health_score', 'growth_score']] = quality_stocks[['value_score', 'health_score', 'growth_score']].values
+    merged.loc[quality_stocks.index, ['value_score', 'health_score', 'growth_score']] = quality_stocks[['value_score', 'health_score', 'growth_score']].values
 
 os.makedirs('data/processed/clean', exist_ok=True)
-merged.to_csv('data/processed/clean/master_clean.csv', index=False)
+if 'news_text' in merged.columns:
+    merged['news_text'] = merged['news_text'].astype(str).replace('nan', '')
+else:
+    merged['news_text'] = ""
+
+merged.to_csv(OUTPUT_FILE, index=False)
 merged.to_json('data/processed/clean/master_clean.json', indent=2, orient='records')
 
 print(f"Processed: {len(merged)} companies")
-print(f"Quality stocks (earnings_quality > 0.05): {len(quality_stocks)}")
-print("\nTop 10 Quality Value Stocks:")
-print(quality_stocks.nlargest(10, 'value_score')[['ticker', 'value_score', 'pe_ratio', 'profit_margins', 'roe', 'earnings_quality']])
+print(f"Saved clean data to {OUTPUT_FILE}")

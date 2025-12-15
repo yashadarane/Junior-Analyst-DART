@@ -1,12 +1,17 @@
 import os
+import sys
 import json
 import time
 from datetime import datetime, timedelta
 from io import StringIO
-
 import requests
 import pandas as pd
 import yfinance as yf
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+sys.path.append(project_root)
+from src.news.news import get_real_news
 
 VALUATION_KEYS = {
     "current_price": "currentPrice",
@@ -58,6 +63,11 @@ def fetch_single_ticker(ticker: str) -> dict:
     clean = {"ticker": ticker}
     for k, yk in ALL_KEYS.items():
         clean[k] = info.get(yk)
+    if clean.get('market_cap') and clean['market_cap'] > 0:
+        clean['news_text'] = get_real_news(ticker)
+        print(f"News fetched for {ticker}")
+    else:
+        clean['news_text'] = ""
     os.makedirs("data/raw", exist_ok=True)
     raw_path = f"data/raw/{ticker.replace('.', '_')}.json"
     with open(raw_path, "w") as f:
