@@ -1,8 +1,6 @@
 # Junior Analyst DART
 ### Digital Asset Research Toolkit
 
-> **"Wall Street grade analysis, automated at the speed of code."**
-
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue) ![Streamlit](https://img.shields.io/badge/Frontend-Streamlit-red) ![Sklearn](https://img.shields.io/badge/AI-Scikit--Learn-orange) ![Status](https://img.shields.io/badge/Status-Operational-success)
 
 ---
